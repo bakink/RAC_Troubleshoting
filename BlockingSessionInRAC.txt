@@ -1,0 +1,255 @@
+--http://yong321.freeshell.org/oranotes/BlockingSessionInRAC.txt
+Blocking Session in RAC
+
+Some non-RAC version of the script to find lock waiter and its blocker may not work in RAC. For 
+instance, if you depend on v$lock.block to be 1 as a blocker, you'll be surprised to see that all 
+sessions almost always have a value of 2 under the block column. In RAC, this value 2 means "The 
+lock is not blocking any blocked processes on the local node, but it may or may not be blocking 
+processes on remote nodes." (11.2 Reference for V$LOCK). ?/rdbms/admin/catblock.sql says 
+"Global... This lock is global, so we can't tell [whether it's blocking]". But we're sure the 
+session is not waiting to get a lock. If it's requesting or waiting for a lock, the block column 
+will be 0. Value 1 still means blocking, but its blocked session, or one of them if multiple, is 
+on the local instance.[note1]
+
+So in RAC, the correct way to identify blocking and waiting session is to follow the script in 
+Note:398519.1, which is
+
+select * from gv$lock where (id1,id2,type) in (select id1,id2,type from gv$lock where request>0);
+
+The output is like:
+
+INST_ID ADDR             KADDR             SID TY     ID1    ID2 LMODE REQUEST CTIME BLOCK
+------- ---------------- ---------------- ---- -- ------- ------ ----- ------- ----- -----
+      7 00000001987B70C0 00000001987B70E0 2085 TX 3538958 401411     0       6   784     0
+      7 00000001987B6F90 00000001987B6FB0 2175 TX 3538958 401411     0       6  1324     0
+      6 000000019B001F60 000000019B001F98 2151 TX 3538958 401411     6       0 44728     2
+      8 00000001987B70C0 00000001987B70E0 2069 TX 3538958 401411     0       6  1277     0
+      8 00000001987B6F90 00000001987B6FB0 2131 TX 3538958 401411     0       6  4240     0
+
+where you see session 2151 on instance 6 (holding an exclusive lock) blocks 4 other sessions 
+(requesting for an exclusive lock).
+
+In 10g, gv$session has blocking_instance and blocking_session. So the following query can also 
+be used.
+
+select inst_id, sid, blocking_instance, blocking_session from gv$session
+where blocking_instance is not null and blocking_session is not null and blocking_session_status='VALID'
+order by 1, 2;
+
+The output is like:
+
+INST_ID  SID BLOCKING_INSTANCE BLOCKING_SESSION
+------- ---- ----------------- ----------------
+      7 2085                 6             2151
+      7 2175                 6             2151
+      8 2069                 6             2151
+      8 2131                 6             2151
+
+The difference between the above two queries is that the second query clearly shows the 4 sessions 
+blocked by session 2151 on instance 6. But in the first query, it's not that obvious;[note2] since all 
+5 sessions are holding or requesting the same type (TX) and same ID1 and ID2 lock, and we know 
+block=0 means waiting, the one in the middle on instance 6 with a non-zero lmode must be blocking 
+the other 4 sessions.
+
+The result of the second query is easy because there's no convoluted multi-level blocking. If that 
+happens, something more sophisticated is needed, such as
+
+/*************************** RAC Blocking Session Monitoring Script *********************************\
+
+--Session is displayed as <inst_id>.<sid>
+with lk as (select blocking_instance||'.'||blocking_session blocker, inst_id||'.'||sid waiter 
+ from gv$session where blocking_instance is not null and blocking_session is not null and blocking_session_status='VALID')
+select lpad('  ',2*(level-1))||waiter lock_tree from
+ (select * from lk
+  union all
+  select distinct 'root', blocker from lk
+  where blocker not in (select waiter from lk))
+connect by prior waiter=blocker start with blocker='root';
+
+--Generate SQLs to kill top-level blockers [note3]
+--To prevent killing wrong sessions, username:program is prefixed to the kill-session SQL for you to confirm
+set serverout on
+declare
+  sess varchar2(20);
+  sessinfo varchar2(29);
+begin
+  for i in 
+    (with lk as (select blocking_instance||'.'||blocking_session blocker, inst_id||'.'||sid waiter
+       from gv$session where blocking_instance is not null and blocking_session is not null and blocking_session_status='VALID')
+     select distinct blocker from lk where blocker not in (select waiter from lk)
+    )
+  loop
+    select regexp_substr(i.blocker,'[0-9]+$')||','||serial# ||',@' || regexp_substr(i.blocker,'[0-9]+'), 
+      substr(username||':'||program,1,29) into sess, sessinfo
+    from gv$session where inst_id = regexp_substr(i.blocker,'[0-9]+') and sid = regexp_substr(i.blocker,'[0-9]+$');
+    dbms_output.put_line(sessinfo || ' ' || 'alter system kill session ''' || sess || ''' immediate;');
+  end loop;
+end;
+/
+
+\****************************************************************************************************/
+
+Here's an example of what I once captured on our 8-node RAC, showing 3 sessions blocking many others:
+
+LOCK_TREE
+---------------------------
+2.2097
+  2.1022
+    2.1943
+    2.2082
+    3.1879
+    3.2054
+3.2108
+  2.1946
+    3.2031
+7.1909
+  2.1895
+  2.1908
+  2.1910
+  2.1951
+  2.2000
+  2.2160
+  2.2172
+    3.1918
+    3.1962
+      2.2129
+    3.2043
+    3.2076
+    3.2089
+    3.2103
+
+If you have too many sessions to kill, kill the one blocking the most, e.g. 7.1909 in this case. The PL/SQL 
+block shown above outputs session killing SQLs for the top level blockers. Its result for the above lock 
+tree would be
+
+APP_USER:httpd@d1prlsoas4 (TNS V1 alter system kill session '2097,27841,@2' immediate;
+APP_USER:httpd@d1prlsoas4 (TNS V1 alter system kill session '2108,15615,@3' immediate;
+SCOTT:SQL Developer alter system kill session '1909,15615,@7' immediate;
+
+Feel free to change program in the PL/SQL block to other columns such as sql_id (to see the SQLs the blockers 
+are running), or modify the code just to vertically align the alter system SQLs for easy copying and pasting 
+multiple lines.
+
+[Update 2014-10] It appears that the above code does not always identify the real root blocker. Suppose the 
+lock tree is
+
+LOCK_TREE
+----------
+2.646
+  6.2548
+6.759
+  8.2911
+
+and gv$lock has
+
+SQL> select ... from gv$lock where sid in (646,759) and type != 'AE' order by type, sid, block;
+
+INST_ID SID TY      ID1   ID2 LMODE REQUEST CTIME BLOCK
+------- --- -- -------- ----- ----- ------- ----- -----
+      2 646 TM   834435     0     3       0   360     2 <--
+      6 759 TM   834435     0     0       3   356     0 <--
+      6 759 TM   834373     0     3       0   367     2
+      6 759 TM   834372     0     3       0   356     2
+      2 646 TX 21954565 25337     6       0   360     2
+      6 759 TX 16318471 54926     6       0   367     2
+
+we can tell session 2.646 locks table with object_id 834435 (in mode 3) while 6.759 requests for it (in mode 3 
+too). So killing 646 is preferred to killing 759. Since the lock type is TM, gv$locked_object can give us the 
+same information.
+
+SQL> select ... from gv$locked_object where session_id in (646,759);
+
+INST_ID OBJECT_ID SESSION_ID LOCKED_MODE
+------- --------- ---------- -----------
+      6    834373        759           3
+      6    834372        759           3
+      6    834435        759           0 <--
+      2    834435        646           3 <--
+
+
+
+/* old, can be ignored
+In older 10g versions, querying the blocking_instance and blocking_session columns of gv$session may 
+take a while, at least up to Oracle 10.2.0.3 (I can't find the bug#). It's not using CPU though. 
+But a potential problem of incorrect values in earlier 10g versions may stop you from using 
+this method. See Bugs 5677058 and 5481650. These problems rarely occur in 10.2.0.4. Only once 
+did I get a lock tree where the locker pointed to a wrong session, DBW0 on a different 
+instance. In that case, trust gv$lock; see which session on which instance holds a lock and 
+which session is requesting it.
+*/
+
+
+
+___________________________________________
+
+[note1]
+Therefore dba_blockers and dba_waiters are inadequate in RAC. Also, they're misnamed views, because 
+by convention dba_xxx views should be database wide and not be based on single-instance v$ or x$ 
+views.
+
+[Update 2013-08] The big query (RAC Blocking Session Monitoring Script) shows nothing, but the other 
+two "smaller" queries do:
+
+SQL> select * from gv$lock where (id1,id2,type) in (select id1,id2,type from gv$lock where request>0);
+
+   INST_ID ADDR             KADDR                   SID TY        ID1        ID2      LMODE    REQUEST      CTIME      BLOCK
+---------- ---------------- ---------------- ---------- -- ---------- ---------- ---------- ---------- ---------- ----------
+         4 000000095BC579C8 000000095BC57A40        468 TX    2162702      41006          6          0       6270          2
+         6 0000000909374318 0000000909374370       1298 TX    2162702      41006          0          6       6269          0
+         4 0000000909377718 0000000909377770        468 TX    3932189     168013          0          6       6269          0
+         6 000000091D3457F8 000000091D345870       1298 TX    3932189     168013          6          0       6269          1
+         6 000000090937F258 000000090937F2B0       1754 TX    3932189     168013          0          6       4890          0
+
+Hints: Block=0 means waiting, 1 means waiting (for a local enqueue only), 2 means NOT waiting (may or may not block).
+So we can say 6.1298 is blocking 6.1754, and also itself (not sure how), line 2 in the result, whose TX slot matches line 1, 
+so 6.1298 on line 2 in turns blocks 4.468 on line 1. 6.1754 is definitely blocked by 6.1298.
+
+The following query is not very helpful:
+
+SQL> select inst_id, sid, blocking_instance, blocking_session from gv$session
+  2  where blocking_instance is not null and blocking_session is not null and blocking_session_status='VALID'
+  3  order by 1, 2;
+
+   INST_ID        SID BLOCKING_INSTANCE BLOCKING_SESSION
+---------- ---------- ----------------- ----------------
+         4        468                 6             1298
+         6       1298                 4              468
+         6       1754                 6             1298
+
+
+
+[note2, update 2013-08] One example in Oracle 11.2.0.3:
+
+SQL> select inst_id, sid, type, id1, id2, lmode, request, ctime, block from gv$lock where (id1,id2,type) in (select id1,id2,type from gv$lock where request>0) order by id1, id2, ctime desc;
+
+   INST_ID        SID TY        ID1        ID2      LMODE    REQUEST      CTIME      BLOCK
+---------- ---------- -- ---------- ---------- ---------- ---------- ---------- ----------
+         2       1482 TX    1310749     168018          6          0      21055          2 <- line 1
+         4         99 TX    1310749     168018          0          6      21052          0 <- line 2
+         4         99 TX    2490391      47406          6          0      21053          2 <- line 3
+         2       1482 TX    2490391      47406          0          6      21051          0 <- line 4
+         4       1018 TX    2621471     555079          6          0      21063          2
+         2       1938 TX    2621471     555079          0          6      21060          0
+         6        655 TX    3932192     183133          6          0      21067          2
+         4       1851 TX    3932192     183133          0          6      21065          0
+         2       1938 TX    5439501     136165          6          0      21063          2
+         4       1018 TX    5439501     136165          0          6      21063          0
+         4       1851 TX    5701661     211193          6          0      21065          2
+         6        655 TX    5701661     211193          0          6      21063          0
+
+I sorted resources (id1,id2 pairs) so you can see clearly. Apparently, for the first resource (1310749,168018), session 2.1482 
+held first in mode 6 (line 1). 3 seconds later, 4.99 requested for it in mode 6 and waited (line 2). But 1 second before 4.99 
+requested for it, it held (2490391,47406) in mode 6 (line 3). This resource in turn was requested for by 2.1482 2 seconds 
+later (line 4). 
+
+
+
+[note3] If you only have one top-level blocker, or only want to kill the bottom one, you can also use this
+SQL to generate the kill-session SQL; you can run again after killing the bottom top-level blocker.
+col blocker new_value sid2kill
+with lk as (select blocking_instance||'.'||blocking_session blocker, inst_id||'.'||sid waiter
+  from gv$session where blocking_instance is not null and blocking_session is not null and blocking_session_status='VALID')
+select distinct blocker from lk where blocker not in (select waiter from lk);
+select 'alter system kill session ''' || regexp_substr(&sid2kill,'[0-9]+$') || ',' || serial# ||
+ ',@' || regexp_substr(&sid2kill,'[0-9]+') || ''' immediate;'
+from gv$session where inst_id = regexp_substr(&sid2kill,'[0-9]+') and sid = regexp_substr(&sid2kill,'[0-9]+$');
