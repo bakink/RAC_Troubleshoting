@@ -1,2 +1,5 @@
 
 --How to Find the Blocker of the 'library cache pin' in a RAC environment? (Doc ID 780514.1)
+--https://www.bobbydurrettdba.com/2014/02/11/library-cache-lock-scripts-for-rac/
+--https://orainternals.wordpress.com/2009/06/02/library-cache-lock-and-library-cache-pin-waits/
+--https://www.hhutzler.de/blog/ges-locks-and-deadlocks/#Library_Cache_LocksPins_in_a_RAC_env
